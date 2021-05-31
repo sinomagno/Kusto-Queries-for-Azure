@@ -1,0 +1,1 @@
+# Kusto-Querys-for-Azure
