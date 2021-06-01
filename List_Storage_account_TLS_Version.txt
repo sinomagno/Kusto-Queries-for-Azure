@@ -1,0 +1,7 @@
+resources
+| where type =~ 'microsoft.storage/storageaccounts'
+| project StorageName=name, Storage_account_Type=kind,
+		 TLS_Version=case(properties.minimumTlsVersion == 'TLS1_3', 'TLS v1.3',
+		 				properties.minimumTlsVersion == 'TLS1_2', 'TLS v1.2',
+		 				properties.minimumTlsVersion == 'TLS1_1', 'TLS v1.1',
+						'TLS v 1.0')

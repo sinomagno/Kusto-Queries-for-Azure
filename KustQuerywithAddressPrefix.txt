@@ -1,0 +1,151 @@
+resources
+| where type =~ 'microsoft.compute/virtualMachines'
+| extend UUID=properties.vmId
+| extend nics=array_length(properties.networkProfile.networkInterfaces)
+| mvexpand nic=properties.networkProfile.networkInterfaces limit 400
+| where nics == 1 or nic.properties.primary =~ 'true' or isempty(nic)
+| project
+        id,
+		UUID,
+        name,
+        resourceGroup,
+        type,
+        kind,
+        location,
+        edgeZone = iff(tostring(extendedLocation.type) =~ 'EdgeZone', tostring(extendedLocation.name), '-'),
+        subscriptionId,
+        tags,
+        licenseType=case(
+            properties.licenseType =~ 'Windows_Server', 'Azure hybrid benefit',
+            properties.licenseType =~ 'Windows_Client', 'Windows client with multi-tenant hosting',
+            'Not enabled'
+        ),
+        nics = coalesce(tostring(nics), '-'),
+        zones = coalesce(tostring(zones[0]), '-'),
+        os = case(
+            properties.storageProfile.osDisk.osType =~ 'Windows', 'Windows',
+            properties.storageProfile.osDisk.osType =~ 'Linux', 'Linux',
+            '-'
+        ),
+        usesManagedDisks = iff(
+            isnotempty(properties.storageProfile.osDisk.managedDisk), 'Yes',
+            'No'
+        ),
+        disks = coalesce(
+            tostring(
+                iff(isnotempty(properties.storageProfile.osDisk) and isnotnull(properties.storageProfile.osDisk), 1, 0) + coalesce(array_length(properties.storageProfile.dataDisks), 0)
+            ),
+            '-'
+        ),
+        source = coalesce(
+            case(
+                (isnotnull(properties.storageProfile.imageReference.publisher) and isnotempty(properties.storageProfile.imageReference.publisher)), 'Marketplace',
+                (isnotnull(properties.storageProfile.imageReference.id) and isnotempty(properties.storageProfile.imageReference.id) and properties.storageProfile.imageReference contains "Microsoft.Compute/images"), 'Image',
+                (isnotnull(properties.storageProfile.imageReference.id) and isnotempty(properties.storageProfile.imageReference.id) and properties.storageProfile.imageReference contains "Microsoft.Compute/galleries"), 'Shared image',
+                'Disk'
+            ),
+            '-'
+        ),
+        proximityPlacementGroup = coalesce(extract('/proximityPlacementGroups/(.*)', 1, tostring(properties.proximityPlacementGroup.id)), '-'),
+        host = coalesce(extract('/hosts/(.*)', 1, tostring(properties.host.id)), '-'),
+        availabilitySet = coalesce(extract('/availabilitySets/(.*)', 1, tostring(properties.availabilitySet.id)), '-'),
+        vmSize = coalesce(tostring(properties.hardwareProfile.vmSize), '-'),
+        nicId = tostring(tolower(nic.id)),
+        powerState = tostring(split(tolower(properties.extended.instanceView.powerState.code), "powerstate/")[1]),
+        provisioningState = tostring(properties.provisioningState),
+		scaleSet = coalesce(extract('/virtualMachineScaleSets/(.*)', 1, tostring(properties.virtualMachineScaleSet.id)), '-')
+| join kind=leftouter hint.strategy=shuffle (data 
+            | where type =~ 'Microsoft.Network/networkInterfaces' 
+			| extend ipConfigsCount=array_length(properties.ipConfigurations) 
+			| mvexpand ipconfig=properties.ipConfigurations limit 400
+			| where ipConfigsCount == 1 or ipconfig.properties.primary =~ 'true' 
+			| parse kind=regex tostring(ipconfig.properties.subnet.id) with '/virtualNetworks/' virtualNetwork '/subnets/' subnetName
+			| join kind=leftouter (data |where type =~ 'microsoft.network/virtualnetworks'
+				| mvexpand subnet = properties.subnets
+				| extend subnetName = tostring(subnet.name))
+				on subnetName, subscriptionId
+            | project
+                nicId=tolower(id),
+                publicIpId=tostring(ipconfig.properties.publicIPAddress.id),
+                privateIPAddress=tostring(ipconfig.properties.privateIPAddress),
+                subnetName,
+				subnet,
+                virtualNetwork,
+                lbReferences=array_concat(
+                    ipconfig.properties.loadBalancerInboundNatRules,
+                    ipconfig.properties.loadBalancerBackendAddressPools,
+                    ipconfig.properties.applicationGatewayBackendAddressPools))
+        on nicId
+| project-away nicId, nicId1
+| mvexpand lbRef=lbReferences limit 400
+| extend lbId=tolower(extract('(.*)/(inboundNatRules|backendAddressPool)', 1, tostring(lbRef.id)))
+| extend addressprefix = subnet.properties.addressPrefix
+| summarize tags = any(tags), UUID = any(UUID), addressprefix = any(addressprefix) by id, lbId, name, resourceGroup, type, kind, location, subscriptionId, licenseType, nics, zones, os, usesManagedDisks, publicIpId, disks, source,proximityPlacementGroup, host, availabilitySet, vmSize, privateIPAddress, subnetName, virtualNetwork, powerState, provisioningState, scaleSet, edgeZone
+| join kind=leftouter hint.strategy=shuffle (data 
+            | where type =~ 'microsoft.network/loadbalancers' or type =~ 'microsoft.network/applicationgateways' 
+            | mvexpand fipc=properties.frontendIPConfigurations limit 400
+            | summarize lbPublicIpId=any(tostring(fipc.properties.publicIPAddress.id)) by lbId=tolower(id))
+        on lbId
+| summarize lbPublicIpId=any(lbPublicIpId), tags = any(tags), UUID = any(UUID), addressprefix = any(addressprefix) by id, name, resourceGroup, type, kind, location, subscriptionId, licenseType, nics, zones, os, usesManagedDisks, publicIpId, disks, source, proximityPlacementGroup, host, availabilitySet,  vmSize, privateIPAddress, subnetName, virtualNetwork, powerState, provisioningState, scaleSet, edgeZone
+| extend publicIpId=tolower(iff(isnotempty(publicIpId), publicIpId, lbPublicIpId))
+| project-away lbPublicIpId
+| join kind=leftouter hint.strategy=shuffle (data 
+            | where type =~ 'microsoft.network/publicipaddresses' 
+            | project publicIpId=tolower(id), publicIpAddress=tostring(properties.ipAddress), publicDnsName=tostring(properties.dnsSettings.fqdn))
+        on publicIpId
+| project-away publicIpId, publicIpId1
+| extend ring = tags.ring, Patchinring = tags.PatchRing
+| project id,
+	UUID,
+        name,
+        resourceGroup,
+        type,
+        kind,
+        location,
+        subscriptionId,
+        nics,
+        os,
+        status = case(
+            provisioningState =~ 'CREATING', 'Creating',
+            provisioningState =~ 'DELETING', 'Deleting',
+            (provisioningState =~ 'FAILED' and isnotnull(powerState) and isnotempty(powerState)), case(
+                powerState =~ 'RUNNING', 'Running',
+                powerState =~ 'STOPPED', 'Stopped',
+                powerState =~ 'DEALLOCATED', 'Stopped (deallocated)',
+                'Unknown'
+            ),
+            provisioningState =~ 'FAILED', 'Failed',
+            (provisioningState =~ 'SUCCEEDED' and isnotnull(powerState) and isnotempty(powerState)), case(
+                powerState =~ 'RUNNING', 'Running',
+                powerState =~ 'STOPPED', 'Stopped',
+                powerState =~ 'DEALLOCATED', 'Stopped (deallocated)',
+                powerState =~ 'STARTING', 'Starting',
+                'Unknown'
+            ),
+            (provisioningState =~ 'UPDATING' and isnotnull(powerState) and isnotempty(powerState)), case(
+                powerState =~ 'DEALLOCATING', 'Deallocating',
+                powerState =~ 'RUNNING', 'Running',
+                powerState =~ 'STARTING', 'Starting',
+                powerState =~ 'STOPPING', 'Stopping',
+                'Updating'
+            ),
+            'Unknown'
+        ),
+        disks,
+        availabilitySet,
+        vmSize,
+        virtualNetwork = coalesce(virtualNetwork, '-'),
+        subnetName = coalesce(subnetName, '-'),
+		addressprefix = coalesce(addressprefix, ''),
+        privateIPAddress = coalesce(privateIPAddress, '-'),
+        publicDnsName = coalesce(publicDnsName, '-'),
+        publicIpAddress = coalesce(publicIpAddress, '-'),
+        zones,
+        usesManagedDisks,
+        licenseType,
+        source,
+        proximityPlacementGroup,
+        host,
+	Ring = coalesce(ring, Patchinring, '-'),
+	scaleSet = coalesce(scaleSet, '-'),
+	edgeZone = coalesce(edgeZone, '-')
